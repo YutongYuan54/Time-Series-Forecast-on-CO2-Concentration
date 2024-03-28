@@ -1,0 +1,175 @@
+---
+title: "Time Series Forecast on CO2 Concentration"
+author: "Yutong Yuan"
+date: "01/11/2022"
+output:
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE, results='hide'}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+cUrl = paste0("http://scrippsco2.ucsd.edu/assets/data/atmospheric/", "stations/flask_co2/daily/daily_flask_co2_mlo.csv")
+cFile = basename(cUrl)
+if (!file.exists(cFile)) download.file(cUrl, cFile) 
+co2s = read.table(cFile, header = FALSE, sep = ",",
+                  skip = 69, stringsAsFactors = FALSE, col.names = c("day", "time", "junk1", "junk2", "Nflasks", "quality", "co2"))
+co2s$date = as.Date(co2s$day)
+co2s$time = strptime(paste(co2s$day, co2s$time), format = "%Y-%m-%d %H:%M",tz = "UTC")
+```
+
+```{r}
+# remove low-quality measurements 
+co2s = co2s[co2s$quality == 0, ]
+plot(co2s$date, co2s$co2, log = "y", cex = 0.3, col = "#00000040", xlab = "time", ylab = "ppm", main="Weekly CO2 concencration over time")
+plot(co2s[co2s$date > as.Date("2015/3/1"), c("date", "co2")], log = "y", type = "o", xlab = "time", ylab = "ppm", cex = 0.5, main="Weekly CO2 concencration over time more specify")
+```
+
+```{r}
+# The code below might prove useful.
+co2s$dateWeek = as.Date(lubridate::floor_date(co2s$date, unit = "week"))
+co2s$timeYears = as.numeric(co2s$date)/365.25
+co2s$cos12 = cos(2 * pi * co2s$timeYears)
+co2s$sin12 = sin(2 * pi * co2s$timeYears)
+co2s$cos6 = cos(2 * 2 * pi * co2s$timeYears)
+co2s$sin6 = sin(2 * 2 * pi * co2s$timeYears)
+allDays = seq(from = min(co2s$dateWeek), to = as.Date("2030/1/1"), by = "7 days") 
+table(co2s$dateWeek %in% allDays)
+```
+
+```{r}
+hist(co2s$co2,xlab = "y", ylab= "Frenquency", main="concentration of Carbon Dioxide distribution", breaks = 50)
+```
+
+
+```{r}
+#install.packages("INLA",repos=c(getOption("repos"),INLA="https://inla.r-inla-download.org/R/stable"), dep=TRUE)
+library("INLA", verbose = FALSE)
+```
+
+```{r}
+# disable some error checking in INLA
+co2s$dateWeekInt = as.integer(co2s$dateWeek)
+mm = get("inla.models", INLA:::inla.get.inlaEnv())
+if (class(mm) == "function") mm = mm()
+mm$latent$rw2$min.diff = NULL
+assign("inla.models", mm, INLA:::inla.get.inlaEnv())
+co2res = inla(co2 ~ sin12 + cos12 + sin6 + cos6 + 
+                f(dateWeekInt, model = "rw2", values = as.integer(allDays), 
+                  prior = "pc.prec",param = c(0.001, 0.5), scale.model = FALSE), data = co2s,
+              family = "gaussian", control.family = list
+              (hyper = list(prec = list(prior = "pc.prec",param = c(1, 0.5)))), control.inla = list(strategy ="gaussian"),
+              control.compute = list(config = TRUE), verbose = TRUE)
+qCols = c("0.5quant", "0.025quant", "0.975quant") 
+1/sqrt(co2res$summary.hyperpar[, qCols])
+matplot(co2res$summary.random$dateWeekInt[, qCols], type = "l", lty = 1)
+```
+
+```{r}
+#install.packages("BiocManager")
+#BiocManager::install("Biobase")
+```
+
+
+```{r}
+# source('https://bioconductor.org/biocLite.R') # biocLite('Biobase')
+library("Biobase", quietly = TRUE)
+sampleList = INLA::inla.posterior.sample(50, co2res) 
+sampleMat = do.call(cbind, Biobase::subListExtract(sampleList, "latent"))
+sampleMean = sampleMat[grep("dateWeekInt", rownames(sampleMat)),]
+sampleDeriv = apply(sampleMean, 2, diff) * (365.25/7) 
+forSinCos = 2 * pi * as.numeric(allDays)/365.25
+forForecast = cbind(`(Intercept)` = 1, sin12 = sin(forSinCos),
+                    cos12 = cos(forSinCos), sin6 = sin(2 * forSinCos),
+                    cos6 = cos(2 * forSinCos))
+forecastFixed = forForecast %*% sampleMat[paste0(colnames(forForecast),":1"), ]
+forecast = forecastFixed + sampleMean
+```
+
+```{r}
+matplot(allDays, forecast, type = "l", col = "#00000010", lty = 1, log = "y", xlab = "time", ylab = "ppm")
+forX = as.Date(c("2018/1/1", "2025/1/1"))
+forX = seq(forX[1], forX[2], by = "1 year")
+toPlot = which(allDays > min(forX) & allDays < max(forX)) 
+matplot(allDays, forecast, type = "l", col = "#00000020",lty = 1, log = "y", xlab = "time", ylab = "ppm", 
+        xaxs = "i", xaxt = "n", xlim = range(forX), ylim = range(forecast[which.min(abs(allDays - max(forX))), ]))
+points(co2s$date, co2s$co2, col = "red", cex = 0.3) 
+axis(1, as.numeric(forX),format(forX, "%Y")) 
+matplot(allDays, co2res$summary.random$dateWeekInt[,qCols], type = "l", col = "black", 
+        lty = c(1, 2,2), xlab = "time", ylab = "y")
+abline(v=as.numeric(as.Date("1989-11-15")),col="red")
+abline(v=as.numeric(as.Date("2020-02-15")),col="red")
+title("Random effect of time")
+
+matplot(allDays[-1], sampleDeriv, type = "l", lty = 1,xaxs = "i", col = "#00000020", 
+        xlab = "time", ylab = "deriv",ylim = quantile(sampleDeriv, c(0.025, 0.995))) 
+abline(v=as.numeric(as.Date("1989-11-15")),col="blue")
+abline(v=as.numeric(as.Date("2020-02-15")),col="blue")
+title("Derivative of CO2 Concentration along time")
+
+matplot(allDays[toPlot], sampleDeriv[toPlot, ], type = "l",lty = 1, lwd = 2, xaxs = "i", col = "#00000020", 
+        xlab = "time", ylab = "deriv", xaxt = "n", ylim = quantile(sampleDeriv[toPlot,], c(0.01, 0.995)))
+axis(1, as.numeric(forX), format(forX, "%Y"))
+```
+
+```{r}
+matplot(allDays, forecast, type = "l", col = "#00000010",
+  lty = 1, log = "y", xlab = "time", ylab = "ppm")
+forX = as.Date(c("2018/1/1", "2025/1/1"))
+forX = seq(forX[1], forX[2], by = "1 year")
+toPlot = which(allDays > min(forX) & allDays < max(forX))
+abline(v = as.numeric(as.Date("1989-11-01")) , col = "blue")
+abline(v = as.numeric(as.Date("2020-02-01")) , col = "blue")
+title("Weekly CO2 concencration over time")
+
+forX2 = as.Date(c("1988/1/1", "1995/1/1"))
+forX2 = seq(forX2[1], forX2[2], by = "1 year")
+toPlot2 = which(allDays > min(forX2) & allDays < max(forX2))
+
+
+
+matplot(allDays, forecast, type = "l", col = "#00000020",
+  lty = 1, log = "y", xlab = "time", ylab = "ppm",
+  xaxs = "i", xaxt = "n", xlim = range(forX), ylim = range(forecast[which.min(abs(allDays -
+    max(forX))), ]))
+points(co2s$date, co2s$co2, col = "red", cex = 0.3)
+axis(1, as.numeric(forX), format(forX, "%Y"))
+abline(v = as.numeric(as.Date("2020-02-01")) , col = "blue")
+title("Weekly CO2 concencration over time near 2020")
+
+matplot(allDays, co2res$summary.random$dateWeekInt[,
+  qCols], type = "l", col = "black", lty = c(1, 2,
+  2), xlab = "time", ylab = "y")
+abline(v = as.numeric(as.Date("1989-11-01")) , col = "blue")
+abline(v = as.numeric(as.Date("2020-02-01")) , col = "blue")
+
+matplot(allDays[-1], sampleDeriv, type = "l", lty = 1,
+  xaxs = "i", col = "#00000020", xlab = "time", ylab = "deriv",
+  ylim = quantile(sampleDeriv, c(0.025, 0.995)))
+abline(v = as.numeric(as.Date("1989-11-01")) , col = "blue")
+abline(v = as.numeric(as.Date("2020-02-01")) , col = "blue")
+abline(h = 0)
+
+matplot(allDays[toPlot], sampleDeriv[toPlot, ], type = "l",
+  lty = 1, lwd = 2, xaxs = "i", col = "#00000020",
+  xlab = "time", ylab = "deriv", xaxt = "n", ylim = quantile(sampleDeriv[toPlot,
+    ], c(0.01, 0.995)))
+axis(1, as.numeric(forX), format(forX, "%Y"))
+abline(v = as.numeric(as.Date("2020-02-01")) , col = "blue")
+abline(h = 0)
+title("Derivative of CO2 Concentration near 2020")
+
+matplot(allDays[toPlot2], sampleDeriv[toPlot2, ], type = "l",
+  lty = 1, lwd = 2, xaxs = "i", col = "#00000020",
+  xlab = "time", ylab = "deriv", xaxt = "n", ylim = quantile(sampleDeriv[toPlot2,
+    ], c(0.01, 0.995)))
+axis(1, as.numeric(forX2), format(forX2, "%Y"))
+abline(v = as.numeric(as.Date("1989-11-01")) , col = "blue")
+abline(h = 0)
+title("Derivative of CO2 Concentration near 1989")
+```
+
